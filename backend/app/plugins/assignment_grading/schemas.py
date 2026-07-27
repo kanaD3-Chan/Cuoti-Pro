@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class QuestionUpdateRequest(BaseModel):
@@ -6,6 +6,11 @@ class QuestionUpdateRequest(BaseModel):
     student_answer: str | None = None
     correct_answer: str | None = None
     knowledge_point: str | None = Field(default=None, max_length=128)
+
+    @field_validator("content", "knowledge_point", mode="before")
+    @classmethod
+    def normalize_text_fields(cls, value: object):
+        return value.strip() if isinstance(value, str) else value
 
 
 class ModelQuestion(BaseModel):
@@ -30,7 +35,7 @@ class ModelQuestion(BaseModel):
 
 class ModelGradePayload(BaseModel):
     subject: str
-    questions: list[ModelQuestion] = Field(min_length=1)
+    questions: list[ModelQuestion] = Field(default_factory=list, min_length=0)
     total_score: float = Field(ge=0)
     student_score: float = Field(ge=0)
     overall_comment: str = Field(min_length=1)

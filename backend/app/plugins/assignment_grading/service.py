@@ -1,4 +1,3 @@
-import asyncio
 import uuid
 from pathlib import Path
 
@@ -8,11 +7,16 @@ from sqlalchemy.orm import Session
 
 from app.kernel.context import KernelContext, get_kernel_context
 from app.kernel.models import User
+from app.kernel.responses import SAFE_AGENT_ERROR_MESSAGE
 from app.plugins.assignment_grading.models import Assignment, ProcessingTask, Question
 from app.plugins.assignment_grading.schemas import ModelGradePayload, QuestionUpdateRequest
 from app.plugins.assignment_grading.workflow import regrade_text_question, run_grading_workflow
 from app.plugins.mastery_tracking.service import ensure_knowledge_point, update_mastery
 from app.plugins.wrong_question_book.service import remove_wrong_question, upsert_wrong_question
+
+
+class NoQuestionsDetected(Exception):
+    pass
 
 
 async def create_assignment(
@@ -26,6 +30,16 @@ async def create_assignment(
     subject = subject.strip()
     if not subject:
         raise HTTPException(status_code=400, detail="请填写学科")
+    if len(subject) > 32:
+        raise HTTPException(status_code=400, detail="学科名称不能超过 32 个字符")
+    # 文件大小检查（提前拦截，给出人话提示）
+    content = await file.read()
+    if len(content) > context.settings.max_upload_mb * 1024 * 1024:
+        raise HTTPException(
+            status_code=400,
+            detail=f"文件太大，最大支持 {context.settings.max_upload_mb}MB",
+        )
+    await file.seek(0)  # 重置文件指针，供后续存储使用
     file_path, suffix = await context.capabilities.storage.save_upload(file, user.id, "uploads")
     assignment = Assignment(
         user_id=user.id,
@@ -45,7 +59,7 @@ async def create_assignment(
     return assignment, task
 
 
-def process_assignment_task(task_id: str) -> None:
+async def process_assignment_task(task_id: str) -> None:
     context = get_kernel_context()
     with context.capabilities.database.session() as db:
         try:
@@ -64,7 +78,16 @@ def process_assignment_task(task_id: str) -> None:
             user = db.get(User, assignment.user_id)
             if user is None:
                 raise RuntimeError("assignment owner does not exist")
-            payload = asyncio.run(run_grading_workflow(context, assignment.file_path, assignment.subject, user.grade))
+            payload = await run_grading_workflow(
+                context,
+                assignment.file_path,
+                assignment.subject,
+                user.grade,
+                student_id=str(user.id),
+            )
+
+            if not payload.questions:
+                raise NoQuestionsDetected("未能从作业中识别到题目，请上传更清晰的图片或包含实际题目的内容")
 
             _set_task_state(task, assignment, "保存批改结果", 85)
             db.commit()
@@ -84,13 +107,16 @@ def process_assignment_task(task_id: str) -> None:
                 metadata={"task_id": task.id, "question_count": len(payload.questions), "subject": assignment.subject},
             )
             db.commit()
-        except Exception as error:
+        except Exception as task_error:
             db.rollback()
             task = db.get(ProcessingTask, task_id)
             if task is not None:
                 task.status = "failed"
                 task.step = "failed"
-                task.error_message = str(error)[:1000]
+                if isinstance(task_error, NoQuestionsDetected):
+                    task.error_message = str(task_error)
+                else:
+                    task.error_message = SAFE_AGENT_ERROR_MESSAGE
                 assignment = db.get(Assignment, task.assignment_id)
                 if assignment is not None:
                     assignment.status = "failed"
@@ -103,7 +129,7 @@ def process_assignment_task(task_id: str) -> None:
                         resource_id=assignment.id,
                         summary="Assignment grading task failed",
                         metadata={"task_id": task.id, "subject": assignment.subject},
-                        error_message=str(error),
+                        error_message=SAFE_AGENT_ERROR_MESSAGE,
                     )
                 db.commit()
 
@@ -129,8 +155,7 @@ def persist_grade_payload(context: KernelContext, db: Session, assignment: Assig
         )
         db.add(question)
         db.flush()
-        if not question.needs_review:
-            update_mastery(db, assignment.user_id, assignment.subject, point, item.is_correct)
+        update_mastery(db, assignment.user_id, assignment.subject, point, item.is_correct)
         if not item.is_correct:
             upsert_wrong_question(
                 db,
@@ -160,7 +185,6 @@ async def update_and_regrade_question(
 
     old_point = question.knowledge_point
     old_is_correct = question.is_correct
-    old_needs_review = question.needs_review
     for field in ("content", "student_answer", "correct_answer", "knowledge_point"):
         value = getattr(patch, field)
         if value is not None:
@@ -174,6 +198,7 @@ async def update_and_regrade_question(
         question.content,
         question.student_answer,
         question.correct_answer,
+        student_id=str(user.id),
     )
     question.is_correct = bool(result["is_correct"])
     question.score = float(result["score"])
@@ -182,10 +207,9 @@ async def update_and_regrade_question(
     question.confidence = float(result["confidence"])
     question.needs_review = question.confidence < context.settings.review_confidence_threshold
 
-    if old_is_correct is not None and not old_needs_review:
+    if old_is_correct is not None:
         update_mastery(db, user.id, assignment.subject, old_point, old_is_correct, delta=-1)
-    if not question.needs_review:
-        update_mastery(db, user.id, assignment.subject, question.knowledge_point, question.is_correct)
+    update_mastery(db, user.id, assignment.subject, question.knowledge_point, question.is_correct)
 
     if question.is_correct:
         remove_wrong_question(db, question.id)
