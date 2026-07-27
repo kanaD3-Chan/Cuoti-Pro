@@ -1,0 +1,86 @@
+/* ==========================================================================
+ * 全局样式重置与工具类
+ * ========================================================================== */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  font-family:
+    'PingFang SC',
+    'Microsoft YaHei',
+    'Helvetica Neue',
+    Helvetica,
+    Arial,
+    sans-serif;
+  font-size: 14px;
+  color: var(--cuoti-text-primary);
+  background: var(--cuoti-bg-app);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* 滚动条 */
+@include scrollbar;
+
+/* 工具类 */
+.cuoti-ellipsis {
+  @include ellipsis;
+}
+
+.cuoti-flex-center {
+  @include flex-center;
+}
+
+.cuoti-flex-between {
+  @include flex-between;
+}
+
+/* 脉冲动画（用于连接状态、打字中） */
+@keyframes cuoti-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.6;
+    transform: scale(0.85);
+  }
+}
+
+/* 光标闪烁（流式文本） */
+@keyframes cuoti-caret {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}
+
+.cuoti-caret::after {
+  content: '|';
+  display: inline;
+  margin-left: 2px;
+  color: var(--cuoti-primary);
+  animation: cuoti-caret 1s step-end infinite;
+}
+
+/* Element Plus 覆盖 */
+.el-button {
+  border-radius: var(--cuoti-radius-md);
+}
+
+.el-drawer {
+  --el-drawer-bg-color: var(--cuoti-bg-sidebar);
+}

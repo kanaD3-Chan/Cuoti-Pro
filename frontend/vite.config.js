@@ -1,25 +1,28 @@
-import { defineConfig } from 'vite'
-import vue from '@vitejs/plugin-vue'
-import path from 'path'
-
+import { defineConfig } from 'vite';
+import vue from '@vitejs/plugin-vue';
+import { resolve } from 'path';
 // https://vitejs.dev/config/
 export default defineConfig({
-  plugins: [vue()],
-  resolve: {
-    alias: {
-      '@': path.resolve(__dirname, 'src')
+    plugins: [vue()],
+    resolve: {
+        alias: {
+            '@': resolve(__dirname, 'src')
+        }
+    },
+    css: {
+        preprocessorOptions: {
+            scss: {
+                additionalData: "\n          @use \"@/assets/styles/variables.scss\" as *;\n          @use \"@/assets/styles/mixins.scss\" as *;\n        "
+            }
+        }
+    },
+    server: {
+        port: 5173,
+        proxy: {
+            '/api': {
+                target: 'http://localhost:8000',
+                changeOrigin: true
+            }
+        }
     }
-  },
-  server: {
-    port: 5173,
-    open: true,
-    allowedHosts: true, // 允许 localtunnel 等外部域名访问
-    // 代理配置 - 连接后端时修改这里的 target
-    proxy: {
-      '/api': {
-        target: 'http://localhost:8000', // 本地新版后端
-        changeOrigin: true
-      }
-    }
-  }
-})
+});

@@ -1,26 +1,27 @@
 {
-  "name": "zhi-xue-cuo-ti",
+  "name": "cuoti-agent-frontend",
   "version": "1.0.0",
-  "description": "智学错题 - AI 驱动的个性化学习伴侣",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview"
+    "build": "vue-tsc -b && vite build",
+    "preview": "vite preview",
+    "type-check": "vue-tsc --noEmit"
   },
   "dependencies": {
-    "vue": "^3.4.0",
-    "vue-router": "^4.3.0",
-    "element-plus": "^2.7.0",
     "@element-plus/icons-vue": "^2.3.1",
-    "axios": "^1.7.0",
-    "echarts": "^5.5.0",
-    "pinia": "^2.1.0"
+    "element-plus": "^2.7.6",
+    "pinia": "^2.1.7",
+    "vue": "^3.4.31",
+    "vue-router": "^4.4.0"
   },
   "devDependencies": {
-    "@vitejs/plugin-vue": "^5.0.0",
-    "vite": "^5.3.0",
-    "sass": "^1.77.0"
+    "@types/node": "^20.14.10",
+    "@vitejs/plugin-vue": "^5.0.5",
+    "sass": "^1.77.6",
+    "typescript": "^5.4.5",
+    "vite": "^5.3.3",
+    "vue-tsc": "^2.0.26"
   }
 }
