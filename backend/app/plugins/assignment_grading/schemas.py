@@ -1,48 +1,85 @@
-from pydantic import BaseModel, Field, field_validator, model_validator
+"""场景1: 数据模型（Pydantic + TypedDict）"""
+from __future__ import annotations
+from typing import Optional, TypedDict
+from pydantic import BaseModel, Field
 
 
-class QuestionUpdateRequest(BaseModel):
-    content: str | None = Field(default=None, min_length=1)
-    student_answer: str | None = None
-    correct_answer: str | None = None
-    knowledge_point: str | None = Field(default=None, max_length=128)
+# ── API 请求/响应模型 ──────────────────────────────────────
 
-    @field_validator("content", "knowledge_point", mode="before")
-    @classmethod
-    def normalize_text_fields(cls, value: object):
-        return value.strip() if isinstance(value, str) else value
+class GradeRequest(BaseModel):
+    student_id: str
+    question: str
+    student_answer: str = ""
+    subject: str = "数学"
 
 
-class ModelQuestion(BaseModel):
-    question_number: str
-    question_text: str = Field(min_length=1)
-    student_answer: str | None = None
-    correct_answer: str | None = None
-    question_type: str | None = None
-    knowledge_point: str | None = None
-    score: float = Field(ge=0)
-    max_score: float = Field(gt=0)
-    is_correct: bool
-    explanation: str = Field(min_length=1)
-    confidence: float = Field(ge=0, le=1)
-
-    @model_validator(mode="after")
-    def score_must_not_exceed_max_score(self):
-        if self.score > self.max_score:
-            raise ValueError("question score cannot exceed max_score")
-        return self
+class GradeResult(BaseModel):
+    correct_answer: str = ""
+    is_correct: bool = False
+    score: float = 0.0
+    analysis: str = ""
+    knowledge_points: list[str] = Field(default_factory=list)
+    difficulty: str = "medium"
 
 
-class ModelGradePayload(BaseModel):
+class GradeResponse(BaseModel):
+    code: int = 0
+    data: GradeResult
+
+
+class PaperQuestionResult(BaseModel):
+    number: str = ""
+    question: str = ""
+    student_answer: str = ""
+    correct_answer: str = ""
+    is_correct: bool = False
+    score: float = 0.0
+    analysis: str = ""
+    knowledge_points: list[str] = Field(default_factory=list)
+    difficulty: str = "medium"
+    question_type: str = "other"
+
+
+class PaperSummary(BaseModel):
+    total: int = 0
+    correct: int = 0
+    wrong: int = 0
+    partial: int = 0
+    avg_score: float = 0.0
+
+
+class PaperGradeResponse(BaseModel):
+    questions: list[PaperQuestionResult] = Field(default_factory=list)
+    summary: PaperSummary = Field(default_factory=PaperSummary)
+    error: str | None = None
+
+
+# ── LangGraph 内部状态 ─────────────────────────────────────
+
+class SingleGradeState(TypedDict, total=False):
+    student_id: str
+    question: str
+    student_answer: str
     subject: str
-    questions: list[ModelQuestion] = Field(default_factory=list, min_length=0)
-    total_score: float = Field(ge=0)
-    student_score: float = Field(ge=0)
-    overall_comment: str = Field(min_length=1)
-    weak_points: list[str] = Field(default_factory=list)
+    image_path: str | None
+    ocr_text: str | None
+    correct_answer: str
+    is_correct: bool
+    score: float
+    analysis: str
+    knowledge_points: list[str]
+    difficulty: str
+    memory_updates: list | None
+    recalled_memory_summary: str | None
 
-    @model_validator(mode="after")
-    def total_score_must_be_valid(self):
-        if self.student_score > self.total_score:
-            raise ValueError("assignment score cannot exceed total_score")
-        return self
+
+class PaperGradeState(TypedDict, total=False):
+    student_id: str
+    subject: str
+    raw_text: str
+    image_path: str | None
+    source_type: str
+    questions: list[dict]
+    results: list[dict]
+    summary: dict
+    memory_updates: list | None

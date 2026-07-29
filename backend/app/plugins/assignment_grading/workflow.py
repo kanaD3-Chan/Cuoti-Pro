@@ -1,128 +1,121 @@
-import base64
-from pathlib import Path
-from typing import TypedDict
-
-import fitz
-
-from app.kernel.agent import AgentStep
-from app.kernel.context import KernelContext
-from app.plugins.assignment_grading.prompts import (
-    GRADING_SYSTEM_PROMPT,
-    REGRADE_SYSTEM_PROMPT,
-    build_assignment_grading_prompt,
-    build_question_regrade_prompt,
-)
-from app.plugins.assignment_grading.schemas import ModelGradePayload
+"""场景1: 批改工作流（LangGraph）—— 单模型集成"""
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from langgraph.graph import StateGraph, END
+from scenario_1_grading.schemas import SingleGradeState
+from tools.llm_tool import llm_invoke_json
 
 
-class GradingState(TypedDict, total=False):
-    file_path: str
-    student_id: str
-    subject: str
-    grade: str | None
-    image_data_urls: list[str]
-    result: ModelGradePayload
+def build_grader_workflow():
+    """构建单题批改工作流：grade → archive"""
+    g = StateGraph(SingleGradeState)
+
+    def grade_node(state):
+        q = state.get("question", "")
+        a = state.get("student_answer", "")
+        from scenario_1_grading.prompts import GRADE_PROMPT
+        from tools.db_tool import add_knowledge_point
+        prompt = GRADE_PROMPT.format(question=q, student_answer=a, subject=state.get("subject", "数学"))
+        try:
+            r = llm_invoke_json(prompt, temperature=0.1)
+            for kp in r.get("knowledge_points", []):
+                add_knowledge_point(kp, subject=state.get("subject", "数学"))
+            return {
+                **state,
+                "correct_answer": r.get("correct_answer", ""),
+                "is_correct": bool(r.get("is_correct", False)),
+                "score": float(r.get("score", 0)),
+                "analysis": r.get("analysis", ""),
+                "knowledge_points": r.get("knowledge_points", []),
+                "difficulty": r.get("difficulty", "medium"),
+            }
+        except Exception as e:
+            return {
+                **state,
+                "correct_answer": "",
+                "is_correct": False,
+                "score": 0,
+                "analysis": f"批改异常: {e}",
+                "knowledge_points": [],
+            }
+
+    def archive_node(state):
+        from tools.db_tool import add_mistake, update_mastery
+        if not state["is_correct"]:
+            add_mistake(state["student_id"], {
+                "question": state["question"],
+                "subject": state.get("subject", "数学"),
+                "student_answer": state["student_answer"],
+                "correct_answer": state["correct_answer"],
+                "analysis": state.get("analysis", ""),
+                "knowledge_points": state.get("knowledge_points", []),
+                "score": state.get("score", 0),
+            })
+            for kp in state.get("knowledge_points", []):
+                update_mastery(state["student_id"], kp, -0.2)
+        else:
+            for kp in state.get("knowledge_points", []):
+                update_mastery(state["student_id"], kp, 0.1)
+        return state
+
+    def memory_node(state):
+        from tools.memory_tool import smart_update_from_session, reflect_after_session
+        sid = state["student_id"]
+        q = state.get("question", "")
+        kps = ", ".join(state.get("knowledge_points", []))
+        try:
+            updates = smart_update_from_session(
+                student_id=sid, question=q,
+                answer_summary=f"批改结果: {'正确' if state['is_correct'] else '错误'}, 得分{state['score']}, 知识点:{kps}",
+            )
+        except Exception:
+            updates = []
+        try:
+            reflect_after_session(student_id=sid, agent_type="grader",
+                summary_md=f"批改题目：{q}\n判断：{'正确' if state['is_correct'] else '错误'}，得分：{state['score']}")
+        except Exception:
+            pass
+        return {**state, "memory_updates": updates}
+
+    g.add_node("grade", grade_node)
+    g.add_node("archive", archive_node)
+    g.add_node("memory", memory_node)
+    g.set_entry_point("grade")
+    g.add_edge("grade", "archive")
+    g.add_edge("archive", "memory")
+    g.add_edge("memory", END)
+    return g.compile()
 
 
-def _load_upload_as_data_urls(file_path: str) -> list[str]:
-    path = Path(file_path)
-    if path.suffix.lower() != ".pdf":
-        media_type = "image/jpeg" if path.suffix.lower() in {".jpg", ".jpeg"} else "image/png"
-        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-        return [f"data:{media_type};base64,{encoded}"]
+if __name__ == "__main__":
+    import os, sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    sys.stdout.reconfigure(encoding="utf-8")
+    from scenario_1_grading.schemas import SingleGradeState
+    from tools.memory_tool import recall_and_summarize
 
-    document = fitz.open(path)
-    try:
-        pages = []
-        for page in document:
-            pixmap = page.get_pixmap(matrix=fitz.Matrix(1, 1), alpha=False)
-            encoded = base64.b64encode(pixmap.tobytes("jpeg")).decode("ascii")
-            pages.append(f"data:image/jpeg;base64,{encoded}")
-        return pages
-    finally:
-        document.close()
-
-
-def build_grading_workflow(context: KernelContext):
-    async def load_node(state: GradingState) -> GradingState:
-        return {"image_data_urls": _load_upload_as_data_urls(state["file_path"])}
-
-    async def ocr_node(state: GradingState) -> GradingState:
-        """Step 1: 视觉识别 — Qwen3-VL 提取文字，不走 function calling"""
-        subject = state["subject"]
-        ocr_prompt = f"请仔细阅读这份{subject}作业的全部页面，逐题提取题目原文、学生作答、以及任何可见的参考答案。按题目顺序输出，每题格式：\n题号: ...\n题目: ...\n学生答案: ...\n参考答案: ...\n\n如果有多个页面，按页面顺序逐页提取。"
-        raw_text = await context.capabilities.llm.vision_ocr(
-            system_prompt="你是一个精确的作业识别助手。逐字提取图片中的文字内容，不要遗漏任何题目或答案。数学公式用 LaTeX 表示。",
-            user_prompt=ocr_prompt,
-            image_data_urls=state["image_data_urls"],
-            temperature=0.1,
-            max_tokens=8000,
-        )
-        return {"_ocr_text": raw_text}
-
-    async def grade_node(state: GradingState) -> GradingState:
-        """Step 2: 推理判分 — DeepSeek 读取 OCR 文本，调用 python_verify 验算"""
-        grade_label = state.get("grade") or ""
-        subject = state["subject"]
-        ocr_text = state.get("_ocr_text", "")
-        grading_prompt = build_assignment_grading_prompt(grade=grade_label, subject=subject)
-        full_prompt = f"{grading_prompt}\n\n以下是 OCR 识别出的作业内容：\n\n{ocr_text}"
-        data = await context.capabilities.llm.chat_json_with_python(
-            GRADING_SYSTEM_PROMPT,
-            full_prompt,
-            context.capabilities.sandbox,
-            temperature=0.1,
-            max_tokens=8000,
-        )
-        return {"result": ModelGradePayload.model_validate(data)}
-
-    return context.capabilities.agent_runtime.compile_linear_workflow(
-        GradingState,
-        [
-            AgentStep("load", load_node),
-            AgentStep("ocr", ocr_node),
-            AgentStep("grade", grade_node),
-        ],
-    )
-
-
-async def run_grading_workflow(
-    context: KernelContext,
-    file_path: str,
-    subject: str,
-    grade: str | None,
-    *,
-    student_id: str,
-) -> ModelGradePayload:
-    graph = build_grading_workflow(context)
-    result = await graph.ainvoke(
-        {"file_path": file_path, "student_id": student_id, "subject": subject, "grade": grade}
-    )
-    return result["result"]
-
-
-async def regrade_text_question(
-    context: KernelContext,
-    subject: str,
-    question_text: str,
-    student_answer: str | None,
-    correct_answer: str | None,
-    *,
-    student_id: str | None = None,
-) -> dict:
-    data = await context.capabilities.llm.chat_json_with_python(
-        REGRADE_SYSTEM_PROMPT,
-        build_question_regrade_prompt(
-            subject=subject,
-            question_text=question_text,
-            student_answer=student_answer,
-            correct_answer=correct_answer,
-        ),
-        context.capabilities.sandbox,
-        temperature=0.1,
-        max_tokens=800,
-    )
-    required = {"is_correct", "score", "max_score", "explanation", "confidence"}
-    if not required.issubset(data):
-        raise ValueError("model regrade result is missing required fields")
-    return data
+    mem = recall_and_summarize(student_id="test001", query="数学", max_count=3)
+    app = build_grader_workflow()
+    state: SingleGradeState = {
+        "student_id": "test001",
+        "question": "求函数 f(x)=x²-4x+3 的顶点坐标",
+        "student_answer": "顶点为(2,-1)",
+        "subject": "数学",
+        "image_path": None,
+        "ocr_text": None,
+        "correct_answer": "",
+        "is_correct": False,
+        "score": 0.0,
+        "analysis": "",
+        "knowledge_points": [],
+        "difficulty": "medium",
+        "memory_updates": None,
+        "recalled_memory_summary": mem,
+    }
+    r = app.invoke(state)
+    print("=== 场景1 单题批改测试 ===")
+    print(f"正确: {r['is_correct']}")
+    print(f"得分: {r['score']}")
+    print(f"正确答案: {r['correct_answer']}")
+    print(f"分析: {r.get('analysis', '')[:100]}")
+    print(f"知识点: {r.get('knowledge_points', [])}")
