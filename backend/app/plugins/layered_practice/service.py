@@ -1,162 +1,103 @@
-from fastapi import HTTPException, status
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+"""场景2: 分层练习业务逻辑"""
+from __future__ import annotations
 
-from app.kernel.context import KernelContext
-from app.kernel.models import User
-from app.kernel.responses import SAFE_AGENT_ERROR_MESSAGE
-from app.plugins.layered_practice.models import PracticeAnswer, PracticeQuestion, PracticeTask
-from app.plugins.layered_practice.schemas import PracticeCreateRequest, PracticeSubmitRequest
-from app.plugins.layered_practice.workflow import generate_practice_questions, grade_practice_answer
-from app.plugins.mastery_tracking.service import ensure_knowledge_point, update_mastery
-from app.plugins.wrong_question_book.service import get_recent_mistakes
+from tools.db_tool import get_mistakes
+from tools.llm_tool import llm_invoke_json
+from tools.memory_tool import recall_and_summarize
+
+from scenario_2_practice.schemas import PracticeState
+from scenario_2_practice.workflow import build_practice_workflow
+from scenario_2_practice.prompts import PROMPT_GRADE_PRACTICE
 
 
-async def create_practice_task(context: KernelContext, db: Session, user: User, request: PracticeCreateRequest) -> PracticeTask:
-    ensure_knowledge_point(db, request.subject, request.knowledge_point)
-    task = PracticeTask(
-        user_id=user.id,
-        subject=request.subject,
-        knowledge_point=request.knowledge_point,
-        difficulty=request.difficulty,
-        question_count=request.question_count,
-        status="generating",
+def detect_weak_points_from_mistakes(
+    student_id: str, subject: str = "数学", min_count: int = 2,
+) -> list[str]:
+    """从错题数据中自动识别薄弱知识点，按频次排序。
+
+    对应场景2需求：基于错题数据，定位知识漏洞。
+    """
+    ms = get_mistakes(student_id, days=30, subject=subject)
+    kp_count: dict[str, int] = {}
+    for m in ms:
+        for kp in m.get("knowledge_points", []):
+            if kp:
+                kp_count[kp] = kp_count.get(kp, 0) + 1
+    weak = [kp for kp, c in sorted(kp_count.items(), key=lambda x: -x[1]) if c >= min_count]
+    return weak[:5]
+
+
+def run_practice(
+    student_id: str,
+    weak_points: list[str] | None = None,
+    subject: str = "数学",
+    difficulty: str = "base",
+    max_questions: int = 10,
+) -> dict:
+    """运行分层练习（整轮：出题 → 批改 → 难度递进 → 总结 → 记忆）。
+
+    Args:
+        student_id: 学生ID
+        weak_points: 薄弱知识点列表（为空时自动从错题检测）
+        subject: 学科
+        difficulty: 起始难度 base/variant/advanced/exam
+        max_questions: 单次最大出题数
+
+    Returns:
+        PracticeState 完整状态字典
+    """
+    if not weak_points:
+        weak_points = detect_weak_points_from_mistakes(student_id, subject)
+    if not weak_points:
+        return {"error": "未找到薄弱知识点，请先做题产生错题数据"}
+
+    query_str = " ".join(weak_points)
+    mem_summary = recall_and_summarize(student_id=student_id, query=query_str, max_count=5)
+
+    app = build_practice_workflow()
+    init: PracticeState = {
+        "student_id": student_id,
+        "subject": subject,
+        "weak_points": weak_points,
+        "difficulty": difficulty,
+        "difficulty_changed": False,
+        "questions": [],
+        "current_index": 0,
+        "current_question": {},
+        "student_answer": "",
+        "is_correct": False,
+        "feedback": "",
+        "correct_answer": "",
+        "session_summary": "",
+        "max_questions": max_questions,
+        "covered_points": [],
+        "memory_updates": None,
+        "recalled_memory_summary": mem_summary,
+    }
+    return app.invoke(init)
+
+
+def run_answer(
+    student_id: str,
+    question_json: dict,
+    student_answer: str,
+    weak_points: list[str] | None = None,
+    subject: str = "数学",
+) -> dict:
+    """单题提交批改（不经过完整循环，用于单题问答场景）。"""
+    import json as _json
+    prompt = PROMPT_GRADE_PRACTICE.format(
+        question=question_json.get("question", ""),
+        correct_answer=question_json.get("answer", ""),
+        student_answer=student_answer,
     )
-    db.add(task)
-    db.commit()
-    db.refresh(task)
     try:
-        payload = await generate_practice_questions(
-            context,
-            str(user.id),
-            request.subject,
-            user.grade,
-            request.knowledge_point,
-            request.difficulty,
-            request.question_count,
-            get_recent_mistakes(db, user.id, request.subject, request.knowledge_point),
-        )
-        for index, item in enumerate(payload.questions, start=1):
-            db.add(
-                PracticeQuestion(
-                    practice_task_id=task.id,
-                    question_number=index,
-                    content=item.content,
-                    standard_answer=item.standard_answer,
-                    explanation=item.explanation,
-                    confidence=item.confidence,
-                    confidence_warning=(
-                        item.confidence_warning
-                        or (
-                            "题目与答案的验算置信度偏低，请结合解析自行判断"
-                            if item.confidence < context.settings.review_confidence_threshold
-                            else None
-                        )
-                    ),
-                )
-            )
-        task.status = "ready"
-        context.capabilities.audit.record(
-            db,
-            event_type="practice.generated",
-            actor=user,
-            resource_type="practice_task",
-            resource_id=task.id,
-            summary="Layered practice task generated",
-            metadata={
-                "subject": task.subject,
-                "knowledge_point": task.knowledge_point,
-                "difficulty": task.difficulty,
-                "question_count": task.question_count,
-            },
-        )
-        db.commit()
-        db.refresh(task)
-        return task
-    except Exception:
-        task.status = "failed"
-        context.capabilities.audit.record(
-            db,
-            event_type="practice.generation.failed",
-            actor=user,
-            outcome="failure",
-            resource_type="practice_task",
-            resource_id=task.id,
-            summary="Layered practice generation failed",
-            metadata={
-                "subject": task.subject,
-                "knowledge_point": task.knowledge_point,
-                "difficulty": task.difficulty,
-            },
-            error_message=SAFE_AGENT_ERROR_MESSAGE,
-        )
-        db.commit()
-        raise
-
-
-async def submit_practice_answers(
-    context: KernelContext,
-    db: Session,
-    user: User,
-    task: PracticeTask,
-    request: PracticeSubmitRequest,
-) -> PracticeTask:
-    if task.user_id != user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权提交该练习")
-    question_map = {question.id: question for question in task.questions}
-    submitted_ids = {answer.question_id for answer in request.answers}
-    if len(request.answers) != len(question_map) or submitted_ids != set(question_map):
-        raise HTTPException(status_code=400, detail="请完成并提交所有练习题")
-
-    total_score = 0.0
-    max_score = float(len(question_map) * 10)
-    for input_answer in request.answers:
-        question = question_map[input_answer.question_id]
-        result = await grade_practice_answer(
-            context,
-            str(user.id),
-            task.subject,
-            {"content": question.content, "standard_answer": question.standard_answer},
-            input_answer.answer,
-        )
-        raw_score = float(result["score"])
-        raw_max_score = float(result["max_score"])
-        score = round(min(raw_score / raw_max_score * 10, 10.0), 2)
-        total_score += score
-        db.add(
-            PracticeAnswer(
-                practice_question_id=question.id,
-                answer=input_answer.answer,
-                is_correct=bool(result["is_correct"]),
-                score=score,
-                explanation=str(result["explanation"]),
-                confidence=float(result["confidence"]),
-                confidence_warning=(
-                    "判题置信度偏低，请结合题目与解析自行判断"
-                    if float(result["confidence"]) < context.settings.review_confidence_threshold
-                    else None
-                ),
-            )
-        )
-        update_mastery(db, user.id, task.subject, task.knowledge_point, bool(result["is_correct"]))
-
-    task.student_score = round(total_score / max_score * 100, 1) if max_score else 0
-    task.status = "completed"
-    context.capabilities.audit.record(
-        db,
-        event_type="practice.submitted",
-        actor=user,
-        resource_type="practice_task",
-        resource_id=task.id,
-        summary="Layered practice answers submitted",
-        metadata={
-            "subject": task.subject,
-            "knowledge_point": task.knowledge_point,
-            "difficulty": task.difficulty,
-            "question_count": len(question_map),
-            "student_score": task.student_score,
-        },
-    )
-    db.commit()
-    db.refresh(task)
-    return task
+        r = llm_invoke_json(prompt, temperature=0.1)
+        return {
+            "is_correct": bool(r.get("is_correct", False)),
+            "score": float(r.get("score", 0)),
+            "feedback": r.get("feedback", ""),
+            "correct_answer": question_json.get("answer", ""),
+        }
+    except Exception as e:
+        return {"is_correct": False, "score": 0, "feedback": f"批改异常: {e}", "correct_answer": ""}

@@ -1,58 +1,60 @@
-from typing import Literal
+"""场景2: 数据模型"""
+from __future__ import annotations
+from typing import Optional, Literal, TypedDict
+from pydantic import BaseModel, Field
 
-from pydantic import BaseModel, Field, field_validator
-
-
-PracticeDifficulty = Literal["基础补漏", "同类变式", "综合提升", "高考真题"]
+PracticeDifficulty = Literal["base", "variant", "advanced", "exam"]
+DIFFICULTY_ORDER = ["base", "variant", "advanced", "exam"]
+DIFFICULTY_CN = {
+    "base": "基础补漏", "variant": "同类变式",
+    "advanced": "综合拔高", "exam": "高考真题",
+}
 
 
 class PracticeCreateRequest(BaseModel):
-    subject: str = Field(min_length=1, max_length=32)
-    knowledge_point: str = Field(min_length=1, max_length=128)
-    difficulty: PracticeDifficulty
-    question_count: int = Field(default=5, ge=1, le=10)
-
-    @field_validator("subject", "knowledge_point", mode="before")
-    @classmethod
-    def normalize_required_text(cls, value: object):
-        return value.strip() if isinstance(value, str) else value
+    student_id: str
+    subject: str = "数学"
+    weak_points: list[str] = Field(default_factory=list, description="薄弱知识点，为空时自动从错题检测")
+    difficulty: PracticeDifficulty = "base"
+    max_questions: int = Field(default=10, ge=1, le=20)
 
 
 class PracticeAnswerInput(BaseModel):
     question_id: int
-    answer: str = Field(min_length=1, max_length=5000)
-
-    @field_validator("answer", mode="before")
-    @classmethod
-    def normalize_answer(cls, value: object):
-        return value.strip() if isinstance(value, str) else value
+    answer: str = Field(min_length=1)
 
 
 class PracticeSubmitRequest(BaseModel):
+    student_id: str
     answers: list[PracticeAnswerInput] = Field(min_length=1)
 
 
-class ModelPracticeQuestion(BaseModel):
-    content: str = Field(min_length=1)
-    standard_answer: str = Field(min_length=1)
-    explanation: str = Field(min_length=1)
-    knowledge_point: str = Field(min_length=1, max_length=128)
-    confidence: float = Field(default=0, ge=0, le=1)
-    confidence_warning: str | None = None
-
-    @field_validator("content", "standard_answer", "explanation", "knowledge_point", mode="before")
-    @classmethod
-    def normalize_text_fields(cls, value: object):
-        return value.strip() if isinstance(value, str) else value
+class PracticeQuestionPayload(BaseModel):
+    question: str
+    answer: str
+    solution: str
+    knowledge_points: list[str]
+    difficulty: PracticeDifficulty
+    hint: str
 
 
-class ModelPracticePayload(BaseModel):
-    questions: list[ModelPracticeQuestion] = Field(min_length=1)
+# ── LangGraph 内部状态 ─────────────────────────────────────
 
-    @field_validator("questions")
-    @classmethod
-    def no_duplicate_questions(cls, questions: list[ModelPracticeQuestion]):
-        normalized = [item.content.strip() for item in questions]
-        if len(normalized) != len(set(normalized)):
-            raise ValueError("practice generation returned duplicate questions")
-        return questions
+class PracticeState(TypedDict, total=False):
+    student_id: str
+    subject: str
+    weak_points: list[str]
+    difficulty: str
+    difficulty_changed: bool
+    questions: list[dict]
+    current_index: int
+    current_question: dict
+    student_answer: str
+    is_correct: bool
+    feedback: str
+    correct_answer: str
+    session_summary: str
+    max_questions: int
+    covered_points: list[str]
+    memory_updates: list | None
+    recalled_memory_summary: str | None
